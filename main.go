@@ -8,10 +8,35 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 
 	"github.com/armon/go-socks5"
 	"golang.org/x/crypto/ssh"
 )
+
+// keepAlive sends a heartbeat signal to the server to keep the connection open.
+func keepAlive(client *ssh.Client, interval time.Duration, maxRetries int) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	retries := 0
+	for range ticker.C {
+		// Send a global "keepalive" request.
+		// "keepalive@golang.org" is a standard name used in Go's SSH library.
+		_, _, err := client.SendRequest("keepalive@golang.org", true, nil)
+		if err != nil {
+			retries++
+			log.Printf("Keepalive failed (%d/%d): %v", retries, maxRetries, err)
+			if retries >= maxRetries {
+				log.Printf("Max keepalive retries reached. Closing connection.")
+				client.Close()
+				return
+			}
+		} else {
+			retries = 0 // Reset retries on success
+		}
+	}
+}
 
 func main() {
 	// 1. Define and parse arguments
@@ -40,10 +65,10 @@ func main() {
 	// 3. Configure the SSH Client (User hardcoded to root as requested)
 	config := &ssh.ClientConfig{
 		User: "root",
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Use a secure callback for production
+		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		// Timeout for the initial connection handshake
+		Timeout: 30 * time.Second,
 	}
 
 	// 4. Connect to the SSH server
@@ -54,7 +79,13 @@ func main() {
 	defer client.Close()
 	log.Printf("Connected to SSH server at %s", sshAddr)
 
-	// 5. Create a SOCKS5 server using the SSH client dialer
+	// START KEEPALIVE GOROUTINE
+	// Interval: 60s (ClientAliveInterval)
+	// MaxRetries: 1000 (ClientAliveCountMax)
+	go keepAlive(client, 60*time.Second, 1000)
+
+	log.Printf("Connected to %s with keepalives enabled.", sshAddr)
+
 	conf := &socks5.Config{
 		// Add 'ctx context.Context' as the first parameter
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
